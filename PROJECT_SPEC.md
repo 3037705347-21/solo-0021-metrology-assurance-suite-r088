@@ -65,6 +65,22 @@ The verifier sends `POST /cases/{id}/seal` after an accepted measurement. Only
 measurement with the smallest absolute deviation, creates exactly one evidence
 seal, moves the case to `sealed`, and rejects later mutations.
 
+### 6. Group Case Into Work Order
+
+The steward sends `POST /workorders/{id}/cases` with a case id. The work order
+must be open, the case must exist, and it must not already belong to another
+work order. The order's member set, the case's back-reference, and the
+acceptance audit event are committed together; a rejected attribution leaves
+no member, no binding, and no event behind.
+
+### 7. Close Work Order
+
+A reviewer sends `POST /workorders/{id}/close`. The order can close only when
+it has at least one member and every member case is genuinely `sealed`. The
+completeness decision and the state flip happen in one repository commit, so
+the result is always consistent with the authoritative case states at the
+instant the commit runs.
+
 ## State And Rules
 
 Device state:
@@ -90,6 +106,14 @@ Required invariants:
 - A sealed case cannot accept measurements, reopen, or seal again.
 - Every mutation that changes a case also appends an audit event in the same
   repository commit.
+- A verification case belongs to at most one work order at any time.
+- A work order accepts members only while it is open; a closed order rejects
+  every new attribution.
+- A work order is complete exactly when it has members and every member case is
+  sealed; work in measurement, review, or recheck keeps it open.
+- Attributing a case or closing an order is a single atomic commit: a rejected
+  decision leaves no membership, binding, or audit event behind, and concurrent
+  decisions against the same order serialize into one consistent result.
 
 ## Modules
 
@@ -121,7 +145,10 @@ bounded production smoke command under `cmd/workflowcheck`. The command starts
 an HTTP test server in the same process, calls the public routes, and verifies
 both success and failure behavior. The seal check also races two concurrent
 seal requests to prove that the repository mutation lock permits exactly one
-seal.
+seal. The work-order checks cover the full grouping and closing lifecycle,
+rejected decisions leaving no trace, and two concurrent-race shapes: a case
+attribution racing the close of the same order, and one case raced into two
+different orders. Both must always converge to a single consistent result.
 
 Tests are intentionally deferred for this initialization baseline. The later
 engineering-task stage will add unit and integration tests, including red/green

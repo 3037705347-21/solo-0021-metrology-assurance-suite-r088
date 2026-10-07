@@ -321,7 +321,14 @@ func cloneCases(values map[string]domain.VerificationCase) map[string]domain.Ver
 func cloneWorkOrders(values map[string]domain.WorkOrder) map[string]domain.WorkOrder {
 	result := make(map[string]domain.WorkOrder, len(values))
 	for key, value := range values {
-		value.CaseIDs = append([]string(nil), value.CaseIDs...)
+		if value.CaseIDs != nil {
+			// Allocate at least one slot of backing storage: append into a nil
+			// destination collapses a zero-length, non-nil slice to nil, which
+			// would serialize the member set as JSON null instead of [].
+			cloned := make([]string, len(value.CaseIDs), max(1, len(value.CaseIDs)))
+			copy(cloned, value.CaseIDs)
+			value.CaseIDs = cloned
+		}
 		result[key] = value
 	}
 	return result

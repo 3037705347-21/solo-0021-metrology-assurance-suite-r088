@@ -201,16 +201,16 @@ func (s *Service) ReopenCase(ctx context.Context, caseID string, input contracts
 		if !exists {
 			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
 		}
+		actor := strings.TrimSpace(input.Actor)
+		reason := strings.TrimSpace(input.Reason)
+		if actor == "" || reason == "" {
+			return fmt.Errorf("%w: actor and reason are required", domain.ErrInvalidInput)
+		}
 		if err := item.Reopen(s.now()); err != nil {
 			return err
 		}
 		if err := m.UpdateCase(item); err != nil {
 			return err
-		}
-		actor := strings.TrimSpace(input.Actor)
-		reason := strings.TrimSpace(input.Reason)
-		if actor == "" || reason == "" {
-			return fmt.Errorf("%w: actor and reason are required", domain.ErrInvalidInput)
 		}
 		event, err := domain.NewAuditEvent(
 			m.NextID("event"),
@@ -323,26 +323,57 @@ func (s *Service) CreateWorkOrder(ctx context.Context, input contracts.CreateWor
 	return result, err
 }
 
+// AttachCase groups a case into a customer work order. The membership on both
+// sides and the acceptance record are produced in one repository commit: the
+// order must still be open, the case must exist and not belong to another
+// order yet. Any rejected attribution returns before either record is touched,
+// so it leaves neither a member nor an audit event behind. The repository lock
+// serializes concurrent attributions and closes against the same order.
 func (s *Service) AttachCase(ctx context.Context, workOrderID string, input contracts.AttachCaseRequest) (contracts.WorkOrderResponse, error) {
 	id := strings.TrimSpace(workOrderID)
 	caseID := strings.TrimSpace(input.CaseID)
-	var attached domain.WorkOrder
+	var result contracts.WorkOrderResponse
 	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
 		order, exists := m.WorkOrder(id)
 		if !exists {
 			return fmt.Errorf("%w: work order %s", domain.ErrNotFound, id)
 		}
-		if err := order.AttachCase(caseID, s.now()); err != nil {
+		item, exists := m.Case(caseID)
+		if !exists {
+			return fmt.Errorf("%w: case %s", domain.ErrNotFound, caseID)
+		}
+		if !order.IsOpen() {
+			return fmt.Errorf("%w: work order %s is %s", domain.ErrStateConflict, order.ID, order.State)
+		}
+		if item.WorkOrderID != "" {
+			return fmt.Errorf(
+				"%w: case %s already belongs to work order %s",
+				domain.ErrCaseAlreadyGrouped,
+				item.ID,
+				item.WorkOrderID,
+			)
+		}
+		if order.HasCase(item.ID) {
+			return fmt.Errorf("%w: case %s is already attached to work order %s", domain.ErrStateConflict, item.ID, order.ID)
+		}
+
+		if err := order.AttachCase(item.ID, s.now()); err != nil {
+			return err
+		}
+		if err := item.BindWorkOrder(order.ID, s.now()); err != nil {
 			return err
 		}
 		if err := m.UpdateWorkOrder(order); err != nil {
+			return err
+		}
+		if err := m.UpdateCase(item); err != nil {
 			return err
 		}
 		event, err := domain.NewAuditEvent(
 			m.NextID("event"),
 			"work_order",
 			order.ID,
-			caseID,
+			item.ID,
 			"case_attached",
 			order.Steward,
 			"case attached to customer work order",
@@ -352,54 +383,30 @@ func (s *Service) AttachCase(ctx context.Context, workOrderID string, input cont
 			return err
 		}
 		m.AppendEvent(event)
-		attached = order
-		return nil
-	})
-	if err != nil {
-		return contracts.WorkOrderResponse{}, err
-	}
-
-	var result contracts.WorkOrderResponse
-	err = s.repository.Mutate(ctx, func(m *repository.Mutation) error {
-		item, exists := m.Case(caseID)
-		if !exists {
-			return fmt.Errorf("%w: case %s", domain.ErrNotFound, caseID)
-		}
-		if err := item.BindWorkOrder(id, s.now()); err != nil {
-			return err
-		}
-		if err := m.UpdateCase(item); err != nil {
-			return err
-		}
-		result = workOrderResponse(m, attached)
+		result = workOrderResponse(m, order)
 		return nil
 	})
 	return result, err
 }
 
+// CloseWorkOrder closes a commission as a single atomic decision. Completeness
+// is derived from the authoritative case states inside the same commit that
+// flips the order to closed, so a case attached or still measured/rechecked
+// after the decision was made can never slip in: the repository lock orders
+// concurrent close and attach operations against each other.
 func (s *Service) CloseWorkOrder(ctx context.Context, workOrderID string) (contracts.WorkOrderResponse, error) {
 	id := strings.TrimSpace(workOrderID)
-	complete := false
-	err := s.repository.Read(ctx, func(snapshot repository.Snapshot) error {
-		order, exists := snapshot.WorkOrder(id)
-		if !exists {
-			return fmt.Errorf("%w: work order %s", domain.ErrNotFound, id)
-		}
-		complete = workOrderComplete(snapshot, order)
-		return nil
-	})
-	if err != nil {
-		return contracts.WorkOrderResponse{}, err
-	}
-	if !complete {
-		return contracts.WorkOrderResponse{}, fmt.Errorf("%w: work order %s", domain.ErrWorkOrderIncomplete, id)
-	}
-
 	var result contracts.WorkOrderResponse
-	err = s.repository.Mutate(ctx, func(m *repository.Mutation) error {
+	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
 		order, exists := m.WorkOrder(id)
 		if !exists {
 			return fmt.Errorf("%w: work order %s", domain.ErrNotFound, id)
+		}
+		if !order.IsOpen() {
+			return fmt.Errorf("%w: work order %s is already %s", domain.ErrStateConflict, order.ID, order.State)
+		}
+		if !workOrderComplete(m, order) {
+			return fmt.Errorf("%w: work order %s", domain.ErrWorkOrderIncomplete, order.ID)
 		}
 		if err := order.Close(s.now()); err != nil {
 			return err
@@ -442,25 +449,21 @@ func (s *Service) WorkOrder(ctx context.Context, id string) (contracts.WorkOrder
 
 type workOrderSource interface {
 	Case(id string) (domain.VerificationCase, bool)
-	Measurements(caseID string) []domain.Measurement
 }
 
-// workOrderComplete reports whether every case attached to the work order is
-// finished. A case counts as finished once it holds a recorded measurement or
-// has already been sealed.
+// workOrderComplete reports whether the commission's authoritative work is
+// finished. The only authoritative signal is that every member case has been
+// sealed: a case that is still awaiting measurement, waiting for review, or
+// back in recheck keeps the order open, and an order without members cannot be
+// completed. Missing member references are treated as unfinished rather than
+// silently ignored.
 func workOrderComplete(source workOrderSource, order domain.WorkOrder) bool {
 	if len(order.CaseIDs) == 0 {
 		return false
 	}
 	for _, caseID := range order.CaseIDs {
 		item, exists := source.Case(caseID)
-		if !exists {
-			return false
-		}
-		if item.State == domain.CaseSealed {
-			continue
-		}
-		if len(source.Measurements(caseID)) == 0 {
+		if !exists || item.State != domain.CaseSealed {
 			return false
 		}
 	}
