@@ -65,6 +65,20 @@ The verifier sends `POST /cases/{id}/seal` after an accepted measurement. Only
 measurement with the smallest absolute deviation, creates exactly one evidence
 seal, moves the case to `sealed`, and rejects later mutations.
 
+### 6. Commission Work Order
+
+The steward groups one customer commission's cases under a work order with
+`POST /workorders/{id}/cases`, and closes the commission with
+`POST /workorders/{id}/close` once every member case is sealed.
+
+Grouping and closing are each decided and committed atomically. A case belongs
+to at most one work order at any time (its `work_order_id` back-pointer is the
+authority for membership). A closed work order never accepts a new member, and
+a work order closes only when it has at least one member and every member is
+`sealed`. Rejected grouping or closing leaves no member, binding, or audit
+trace; concurrent operations on the same work order serialize through the
+repository lock and converge on a single consistent result.
+
 ## State And Rules
 
 Device state:
@@ -80,6 +94,11 @@ VerificationCase state:
 - `review_ready -> sealed`
 - `sealed` is terminal.
 
+WorkOrder state:
+
+- `open -> closed`
+- `closed` is terminal and rejects new members.
+
 Required invariants:
 
 - Asset tags are unique after case-insensitive normalization.
@@ -88,6 +107,12 @@ Required invariants:
 - A tolerance must be positive.
 - A case can have at most one evidence seal.
 - A sealed case cannot accept measurements, reopen, or seal again.
+- A case belongs to at most one work order; its back-pointer and the work
+  order's member set are written in the same commit.
+- A work order is complete only when it has at least one member and every
+  member case is sealed; "has a measurement" is not sufficient.
+- Grouping, closing, and their audit events are atomic: a rejected decision
+  leaves no member, case binding, or event behind.
 - Every mutation that changes a case also appends an audit event in the same
   repository commit.
 
@@ -113,6 +138,10 @@ Required invariants:
 - `POST /cases/{id}/reopen`
 - `POST /cases/{id}/seal`
 - `GET /cases/{id}/events`
+- `POST /workorders`
+- `GET /workorders/{id}`
+- `POST /workorders/{id}/cases`
+- `POST /workorders/{id}/close`
 
 ## Validation Plan
 

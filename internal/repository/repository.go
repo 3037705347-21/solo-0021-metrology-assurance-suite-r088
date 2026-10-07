@@ -321,7 +321,11 @@ func cloneCases(values map[string]domain.VerificationCase) map[string]domain.Ver
 func cloneWorkOrders(values map[string]domain.WorkOrder) map[string]domain.WorkOrder {
 	result := make(map[string]domain.WorkOrder, len(values))
 	for key, value := range values {
-		value.CaseIDs = append([]string(nil), value.CaseIDs...)
+		// Preserve a non-nil empty member set so the read and write views
+		// serialize the same "no members" fact instead of drifting to null.
+		members := make([]string, len(value.CaseIDs))
+		copy(members, value.CaseIDs)
+		value.CaseIDs = members
 		result[key] = value
 	}
 	return result

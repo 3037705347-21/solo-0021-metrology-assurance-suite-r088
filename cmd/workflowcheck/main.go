@@ -40,6 +40,7 @@ func main() {
 		"record-measurement":       checkRecordMeasurement,
 		"reopen-verification-case": checkReopenVerificationCase,
 		"seal-verification":        checkSealVerification,
+		"work-order-commission":    checkWorkOrderCommission,
 	}
 	run, ok := checks[*workflow]
 	if !ok {
@@ -375,6 +376,197 @@ func checkSealVerification() error {
 	return nil
 }
 
+// checkWorkOrderCommission drives the customer work order chain through the
+// public HTTP API: grouping cases, the seal-based completion gate, closure,
+// single membership, and rejection traceability.
+func checkWorkOrderCommission() error {
+	h := newHarness()
+	defer h.close()
+
+	first, err := h.createWorkOrder("Acme")
+	if err != nil {
+		return err
+	}
+	second, err := h.createWorkOrder("Beta")
+	if err != nil {
+		return err
+	}
+
+	sealedID, err := h.sealedCaseID("MET-1501")
+	if err != nil {
+		return err
+	}
+	// A case that has recorded an out-of-tolerance measurement and is now
+	// awaiting rework; it must keep the order open until it is later sealed.
+	pendingID, err := h.rejectedCase("MET-1502")
+	if err != nil {
+		return err
+	}
+
+	// An empty order is not complete and cannot close.
+	if err := expectOrderComplete(h, first, false); err != nil {
+		return err
+	}
+	rejectEmpty, err := h.request(http.MethodPost, "/workorders/"+first+"/close", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(rejectEmpty, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(rejectEmpty, "state_conflict"); err != nil {
+		return err
+	}
+
+	// Grouping an unsealed case succeeds but leaves the order open.
+	if err := h.attachCase(first, sealedID); err != nil {
+		return err
+	}
+	if err := h.attachCase(first, pendingID); err != nil {
+		return err
+	}
+	if err := expectOrderComplete(h, first, false); err != nil {
+		return err
+	}
+	rejectUnfinished, err := h.request(http.MethodPost, "/workorders/"+first+"/close", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(rejectUnfinished, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(rejectUnfinished, "state_conflict"); err != nil {
+		return err
+	}
+
+	// A case belongs to exactly one work order; the rejected grouping leaves
+	// no member or case_attached event on the second order.
+	rejectGroup, err := h.request(http.MethodPost, "/workorders/"+second+"/cases", map[string]any{
+		"case_id": sealedID,
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(rejectGroup, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(rejectGroup, "state_conflict"); err != nil {
+		return err
+	}
+	secondView, err := h.getWorkOrder(second)
+	if err != nil {
+		return err
+	}
+	caseIDs, err := nestedStringSlice(secondView.Body, "work_order", "case_ids")
+	if err != nil {
+		return err
+	}
+	if len(caseIDs) != 0 {
+		return fmt.Errorf("rejected grouping left members on second order: %v", caseIDs)
+	}
+	if countEvents(secondView.Body, "case_attached") != 0 {
+		return errors.New("rejected grouping left a case_attached event")
+	}
+
+	// Grouping a nonexistent case leaves no trace on the order.
+	rejectMissing, err := h.request(http.MethodPost, "/workorders/"+first+"/cases", map[string]any{
+		"case_id": "case-9999",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(rejectMissing, http.StatusNotFound); err != nil {
+		return err
+	}
+
+	// Once the last member completes rework and is sealed, the order becomes
+	// complete and closes.
+	reopened, err := h.request(http.MethodPost, "/cases/"+pendingID+"/reopen", map[string]any{
+		"actor":  "Lin",
+		"reason": "measurement setup was replaced",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(reopened, http.StatusOK); err != nil {
+		return err
+	}
+	if err := h.acceptMeasurement(pendingID); err != nil {
+		return err
+	}
+	if err := h.sealCase(pendingID); err != nil {
+		return err
+	}
+	if err := expectOrderComplete(h, first, true); err != nil {
+		return err
+	}
+	closed, err := h.request(http.MethodPost, "/workorders/"+first+"/close", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(closed, http.StatusOK); err != nil {
+		return err
+	}
+	closedState, err := nestedString(closed.Body, "work_order", "state")
+	if err != nil {
+		return err
+	}
+	if closedState != "closed" {
+		return fmt.Errorf("closed order state = %q", closedState)
+	}
+	if countEvents(closed.Body, "work_order_closed") != 1 {
+		return errors.New("missing or duplicated work_order_closed event")
+	}
+
+	// A closed order cannot close again or accept a new member.
+	reclose, err := h.request(http.MethodPost, "/workorders/"+first+"/close", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(reclose, http.StatusConflict); err != nil {
+		return err
+	}
+	extraID, err := h.sealedCaseID("MET-1503")
+	if err != nil {
+		return err
+	}
+	rejectClosed, err := h.request(http.MethodPost, "/workorders/"+first+"/cases", map[string]any{
+		"case_id": extraID,
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(rejectClosed, http.StatusConflict); err != nil {
+		return err
+	}
+	firstView, err := h.getWorkOrder(first)
+	if err != nil {
+		return err
+	}
+	closedMembers, err := nestedStringSlice(firstView.Body, "work_order", "case_ids")
+	if err != nil {
+		return err
+	}
+	if len(closedMembers) != 2 {
+		return fmt.Errorf("closed order member count = %d, want 2", len(closedMembers))
+	}
+	caseAfter, err := h.request(http.MethodGet, "/cases/"+extraID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(caseAfter, http.StatusOK); err != nil {
+		return err
+	}
+	bound, err := optionalNestedString(caseAfter.Body, "case", "work_order_id")
+	if err != nil {
+		return err
+	}
+	if bound != "" {
+		return fmt.Errorf("rejected case was bound to closed order: %q", bound)
+	}
+	return nil
+}
+
 func newHarness() *harness {
 	server := httptest.NewServer(bootstrap.NewHandler())
 	return &harness{
@@ -507,6 +699,144 @@ func (h *harness) readyCase(tag string) (string, error) {
 		return "", err
 	}
 	return caseID, nil
+}
+
+func (h *harness) createWorkOrder(customer string) (string, error) {
+	response, err := h.request(http.MethodPost, "/workorders", map[string]any{
+		"customer": customer,
+		"steward":  "Lin",
+	})
+	if err != nil {
+		return "", err
+	}
+	if err := expectStatus(response, http.StatusCreated); err != nil {
+		return "", err
+	}
+	return nestedString(response.Body, "work_order", "id")
+}
+
+func (h *harness) getWorkOrder(id string) (apiResponse, error) {
+	response, err := h.request(http.MethodGet, "/workorders/"+id, nil)
+	if err != nil {
+		return apiResponse{}, err
+	}
+	if err := expectStatus(response, http.StatusOK); err != nil {
+		return apiResponse{}, err
+	}
+	return response, nil
+}
+
+func (h *harness) attachCase(orderID, caseID string) error {
+	response, err := h.request(http.MethodPost, "/workorders/"+orderID+"/cases", map[string]any{
+		"case_id": caseID,
+	})
+	if err != nil {
+		return err
+	}
+	return expectStatus(response, http.StatusCreated)
+}
+
+// sealedCaseID drives a case all the way to sealed and returns its id.
+func (h *harness) sealedCaseID(tag string) (string, error) {
+	caseID, err := h.readyCase(tag)
+	if err != nil {
+		return "", err
+	}
+	if err := h.sealCase(caseID); err != nil {
+		return "", err
+	}
+	return caseID, nil
+}
+
+func (h *harness) sealCase(caseID string) error {
+	response, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+		"reviewer": "Verifier",
+		"summary":  "accepted measurement sealed",
+	})
+	if err != nil {
+		return err
+	}
+	return expectStatus(response, http.StatusCreated)
+}
+
+// acceptMeasurement records an in-tolerance measurement that moves a case to
+// review_ready so it can subsequently be sealed.
+func (h *harness) acceptMeasurement(caseID string) error {
+	response, err := h.recordMeasurement(caseID, 25.1, "Rui")
+	if err != nil {
+		return err
+	}
+	return expectStatus(response, http.StatusCreated)
+}
+
+func expectOrderComplete(h *harness, orderID string, want bool) error {
+	view, err := h.getWorkOrder(orderID)
+	if err != nil {
+		return err
+	}
+	value, err := nestedAny(view.Body, "complete")
+	if err != nil {
+		return err
+	}
+	complete, ok := value.(bool)
+	if !ok {
+		return fmt.Errorf("complete is not a boolean")
+	}
+	if complete != want {
+		return fmt.Errorf("order complete = %v, want %v", complete, want)
+	}
+	return nil
+}
+
+func nestedStringSlice(root map[string]any, path ...string) ([]string, error) {
+	value, err := nestedValue(root, path...)
+	if err != nil {
+		return nil, err
+	}
+	items, ok := value.([]any)
+	if !ok {
+		return nil, fmt.Errorf("%s is not an array", strings.Join(path, "."))
+	}
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		text, ok := item.(string)
+		if !ok {
+			return nil, fmt.Errorf("%s contains a non-string element", strings.Join(path, "."))
+		}
+		result = append(result, text)
+	}
+	return result, nil
+}
+
+func countEvents(root map[string]any, kind string) int {
+	items, err := nestedSlice(root, "events")
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, item := range items {
+		if event, ok := item.(map[string]any); ok && event["kind"] == kind {
+			count++
+		}
+	}
+	return count
+}
+
+// optionalNestedString returns the value and empty string if the key is absent
+// or null, so omitempty fields can be asserted without failing a normal read.
+func optionalNestedString(root map[string]any, path ...string) (string, error) {
+	value, err := nestedValue(root, path...)
+	if err != nil {
+		return "", nil
+	}
+	if value == nil {
+		return "", nil
+	}
+	text, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("%v is not a string", path)
+	}
+	return text, nil
 }
 
 func expectStatus(response apiResponse, expected int) error {
